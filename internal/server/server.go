@@ -16,6 +16,8 @@ import (
 	"github.com/scrypster/huginn/internal/agent"
 	"github.com/scrypster/huginn/internal/agents"
 	"github.com/scrypster/huginn/internal/backend"
+	"github.com/scrypster/huginn/internal/claudecode"
+	"github.com/scrypster/huginn/internal/claudecode/approvals"
 	"github.com/scrypster/huginn/internal/config"
 	"github.com/scrypster/huginn/internal/connections"
 	catalogpkg "github.com/scrypster/huginn/internal/connections/catalog"
@@ -57,6 +59,16 @@ type Server struct {
 	// agentLoader loads the agent config. Nil uses agents.LoadAgents (production default).
 	// Override in tests to inject a known configuration without touching the filesystem.
 	agentLoader func() (*agents.AgentsConfig, error)
+
+	// agentSaver persists ONE agent. Nil in production — only tests set it —
+	// so callers fall back to agents.SaveAgentDefault, mirroring agentLoader.
+	//
+	// Deliberately single-agent, not func(*agents.AgentsConfig): the whole-
+	// config saver rewrites every <name>.yaml and bumps every agent's Version,
+	// so an unrelated agent open in the config UI took a spurious 409 and a
+	// user on legacy .json agents silently gained .yaml files that then take
+	// precedence over the file they were told to hand-edit.
+	agentSaver func(agents.AgentDef) error
 
 	// onAgentsChanged, if set, is invoked after any agent create/update/rename/
 	// delete/clone is persisted, so the live in-memory agent registry can be
@@ -243,6 +255,16 @@ type Server struct {
 	// nil if not configured.
 	auditLog *auditLogger
 
+	// approvalWg counts in-flight handleClaudeApprove handlers. Stop releases
+	// their waiters and then waits on this before closing the audit log, so a
+	// denial caused by shutdown still reaches the trail.
+	approvalWg sync.WaitGroup
+
+	// approvals holds Claude Code tool-approval requests waiting on a human.
+	// Nil means the feature is unwired, and a nil store DENIES — never allow
+	// because the store is missing.
+	approvals *approvals.Store
+
 	// entityAudit is the append-only JSONL audit trail for entity lifecycle
 	// actions (agent hire/delete, company seat/unseat, memory forget).
 	// Always initialised in New() — never nil.
@@ -265,6 +287,26 @@ type Server struct {
 	// Entries are evicted after swarmSnapshotTTL (1h) by a background goroutine.
 	// Value type: swarmSnapshotEntry
 	swarmSnapshots sync.Map
+
+	// claudeMu guards the claude* fields below. A dedicated lock (not s.mu):
+	// StartClaudeBridge runs during server startup, concurrently with the HTTP
+	// server already accepting requests, and reusing s.mu here would risk a
+	// lock-ordering interaction with the rest of the startup path.
+	claudeMu sync.RWMutex
+	// claudeCfg is the Claude Code bridge configuration, set by StartClaudeBridge.
+	claudeCfg claudecode.Config
+	// claudeIngester converts Claude Code transcripts into Huginn sessions.
+	// nil until StartClaudeBridge succeeds.
+	claudeIngester *claudecode.Ingester
+	// claudeRoot is the Claude Code projects directory being watched.
+	claudeRoot string
+	// claudeWatching reports whether the transcript watcher is running.
+	claudeWatching bool
+	// claudeAgentOwnedSource supplies the Claude Code sessions driven by a
+	// Huginn agent. Read by StartClaudeBridge before it starts any goroutine,
+	// so agent-owned transcripts are never ingested — see
+	// SetClaudeAgentOwnedSource.
+	claudeAgentOwnedSource func() []string
 }
 
 // SetDB wires the SQLite database for thread/message handlers.
@@ -322,6 +364,16 @@ func (s *Server) evictSwarmSnapshots(ctx context.Context) {
 	}
 }
 
+// approvalDeadline is how long a tool approval waits for a human.
+//
+// It MUST stay below the hook's client timeout (claudeApproveTimeout, derived
+// as ClaudeHookTimeoutSecs-10 = 290s) so the server answers before the hook
+// gives up, and that in turn stays below ClaudeHookTimeoutSecs = 300s so the
+// hook prints an explicit deny before Claude Code kills it. Ordering:
+// 285 < 290 < 300. A hook killed by Claude Code fails OPEN, so this ordering
+// is a security property, not a nicety.
+const approvalDeadline = 285 * time.Second
+
 // New creates a new Server. Call Start() to begin serving.
 func New(
 	cfg config.Config,
@@ -344,6 +396,7 @@ func New(
 		token:           token,
 		huginnDir:       huginnDir,
 		wsHub:           newWSHub(),
+		approvals:       approvals.New(approvalDeadline),
 		connMgr:         connMgr,
 		connStore:       connStore,
 		connProviders:   pm,
@@ -481,7 +534,8 @@ func (s *Server) Addr() string {
 //  1. statsPersister.Close() — drain in-flight stats/cost records to SQLite
 //  2. auditLog.Close()       — drain audit events to SQLite
 //  3. wsHub.stop()           — close WS connections
-//  4. http.Server.Shutdown() — stop accepting new requests
+//  4. approvals.Close()      — release every parked approval with Deny
+//  5. http.Server.Shutdown() — stop accepting new requests
 //     (caller's cleanup fn closes db after Stop returns)
 func (s *Server) Stop(ctx context.Context) error {
 	// Flush the stats persister before the HTTP server shuts down so that
@@ -490,6 +544,35 @@ func (s *Server) Stop(ctx context.Context) error {
 	persister := s.statsPersister
 	auditLog := s.auditLog
 	s.mu.Unlock()
+
+	// Release parked approvals FIRST — before the audit log closes, and before
+	// Shutdown. Two separate reasons, both learned the hard way:
+	//
+	// Shutdown waits for in-flight handlers, and handleClaudeApprove blocks for
+	// up to approvalDeadline (285s), so one pending approval made Ctrl-C look
+	// like a hang for nearly five minutes, with the second Ctrl-C swallowed
+	// because the signal had already fired.
+	//
+	// And the audit log used to close here, at the top, while those handlers
+	// were still parked. Every denial Close produced was then enqueued onto a
+	// channel whose drain goroutine had already exited and was dropped: a tool
+	// call was refused and the trail had no record of it. Observed live before
+	// this was fixed. So release the waiters, wait for their handlers to
+	// enqueue their rows, and only then close the log.
+	if s.approvals != nil {
+		s.approvals.Close()
+	}
+	approvalsDrained := make(chan struct{})
+	go func() {
+		s.approvalWg.Wait()
+		close(approvalsDrained)
+	}()
+	select {
+	case <-approvalsDrained:
+	case <-time.After(5 * time.Second):
+		slog.Warn("server: approval handlers did not drain; some denials may be unaudited")
+	}
+
 	if persister != nil {
 		persister.Close()
 	}
@@ -1154,6 +1237,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Unauthenticated endpoints — safe because server binds to 127.0.0.1 only.
 	mux.HandleFunc("GET /api/v1/token", loggingMiddleware(s.handleGetToken))
 	mux.HandleFunc("GET /api/v1/health", loggingMiddleware(requestIDMiddleware(s.handleHealth)))
+	// claude-approve is called by the `huginn claude-approve` PreToolUse hook
+	// (cmd_claude_approve.go), which never sends an Authorization header or
+	// ?token= — it is a local child process, not a browser client. Wrapping
+	// this in api() would make authMiddleware 401 every real approval request,
+	// which the hook client treats as a deny — i.e. approval would silently
+	// never work. Left unauthenticated on the same 127.0.0.1-only basis as
+	// /token and /health above; body size is still capped defensively.
+	mux.HandleFunc("POST /api/v1/claude/approve",
+		loggingMiddleware(requestIDMiddleware(withMaxBody(64<<10, s.handleClaudeApprove))))
 
 	// REST API (auth required)
 	mux.HandleFunc("POST /api/v1/restart", api(s.handleRestart))
@@ -1336,6 +1428,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/companies/{id}/members", api(s.handleSeatCompanyMember))
 	mux.HandleFunc("DELETE /api/v1/companies/{id}/members/{agent}", api(s.handleUnseatCompanyMember))
 	mux.HandleFunc("DELETE /api/v1/companies/{id}", api(s.handleDeleteCompany))
+
+	// Claude Code bridge API (authenticated)
+	// POST /api/v1/claude/approve is registered in the unauthenticated block
+	// above, not here — see the comment there for why.
+	mux.HandleFunc("GET /api/v1/claude/status", api(s.handleClaudeStatus))
+	mux.HandleFunc("POST /api/v1/claude/backfill", api(s.handleClaudeBackfill))
+	mux.HandleFunc("GET /api/v1/claude/approvals", api(s.handleListClaudeApprovals))
+	mux.HandleFunc("POST /api/v1/claude/approve/decide", api(withMaxBody(4<<10, s.handleDecideClaudeApproval)))
 
 	// Spaces API (authenticated)
 	// NOTE: route ordering matters in Go 1.22+ ServeMux.

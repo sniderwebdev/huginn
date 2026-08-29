@@ -1,0 +1,429 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	agentslib "github.com/scrypster/huginn/internal/agents"
+	"github.com/scrypster/huginn/internal/claudecode"
+)
+
+// TestGatedToolsForUsesTheAgentsExplicitList: a configured list wins outright,
+// with no silent union against the defaults.
+func TestGatedToolsForUsesTheAgentsExplicitList(t *testing.T) {
+	ag := &agentslib.Agent{ClaudeGatedTools: []string{"Bash"}}
+	got := gatedToolsFor(ag)
+	if len(got) != 1 || got[0] != "Bash" {
+		t.Fatalf("gatedToolsFor = %v, want exactly [Bash]", got)
+	}
+}
+
+// TestGatedToolsForNeverReturnsEmpty is the security-critical case.
+//
+// BuildHookSettings emits NO PreToolUse hooks for an empty list, so an agent
+// with no configured gating would run every tool — Bash included — with no
+// approval round-trip at all. This test fails if the empty case returns nil or
+// an empty slice, and it proves the fallback actually produces hooks.
+func TestGatedToolsForNeverReturnsEmpty(t *testing.T) {
+	cases := map[string]*agentslib.Agent{
+		"nil agent":         nil,
+		"unset gated tools": {Name: "Unconfigured"},
+		"empty gated tools": {Name: "Empty", ClaudeGatedTools: []string{}},
+		// LocalTools must not be consulted: it is Huginn's namespace, and its
+		// "*" wildcard means "all Huginn builtins", never "no Claude gating".
+		"wildcard local tools": {Name: "Wild", LocalTools: []string{"*"}},
+	}
+	for name, ag := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := gatedToolsFor(ag)
+			if len(got) == 0 {
+				t.Fatal("gatedToolsFor returned an empty set: BuildHookSettings would emit no hooks and the agent would run ungated")
+			}
+			settings, err := claudecode.BuildHookSettings(got, "huginn claude-approve")
+			if err != nil {
+				t.Fatalf("BuildHookSettings: %v", err)
+			}
+			if settings == "" {
+				t.Fatal("the fallback gated set produced no --settings payload, i.e. no approval hook")
+			}
+			var sawBash bool
+			for _, tool := range got {
+				if tool == "Bash" {
+					sawBash = true
+				}
+			}
+			if !sawBash {
+				t.Errorf("default gated set does not gate Bash: %v", got)
+			}
+		})
+	}
+}
+
+// TestGatedToolsForDoesNotAliasTheAgentSlice: the returned slice must be a
+// copy, or a caller mutating it would rewrite the agent's stored policy.
+func TestGatedToolsForDoesNotAliasTheAgentSlice(t *testing.T) {
+	ag := &agentslib.Agent{ClaudeGatedTools: []string{"Bash", "Write"}}
+	got := gatedToolsFor(ag)
+	got[0] = "Read"
+	if ag.ClaudeGatedTools[0] != "Bash" {
+		t.Fatalf("agent's gated tools mutated through the returned slice: %v", ag.ClaudeGatedTools)
+	}
+
+	def := gatedToolsFor(&agentslib.Agent{})
+	def[0] = "Read"
+	if claudecode.DefaultGatedTools[0] == "Read" {
+		t.Fatal("package-level DefaultGatedTools mutated through the returned slice")
+	}
+}
+
+func TestClaudeSessionExistsUnder(t *testing.T) {
+	root := t.TempDir()
+	const cwd = "/Users/dev/project"
+	proj := filepath.Join(root, "-Users-dev-project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const id = "11111111-2222-3333-4444-555555555555"
+	if err := os.WriteFile(filepath.Join(proj, id+".jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !claudeSessionExistsUnder(root, cwd, id) {
+		t.Error("an existing transcript nested under a project dir was not found; the first turn would try to claim an id the CLI already owns")
+	}
+	if claudeSessionExistsUnder(root, cwd, "99999999-9999-4999-8999-999999999999") {
+		t.Error("reported a session that does not exist; the turn would --resume a session Claude Code has never created")
+	}
+	if claudeSessionExistsUnder(root, cwd, "") {
+		t.Error("an empty session id must never count as existing")
+	}
+	if claudeSessionExistsUnder("", cwd, id) {
+		t.Error("an empty root must never count as existing")
+	}
+	if claudeSessionExistsUnder(filepath.Join(root, "missing"), cwd, id) {
+		t.Error("a missing root must not report the session as existing")
+	}
+}
+
+// TestClaudeSessionExistsFallsBackWhenTheProjectDirGuessIsWrong is the reason
+// the fast path is only a fast path. The CLI's directory naming is verified
+// only for the separator rule, so a cwd whose derived name does not match must
+// still find the transcript — a false "does not exist" makes the next turn
+// claim a session id Claude Code already owns.
+func TestClaudeSessionExistsFallsBackWhenTheProjectDirGuessIsWrong(t *testing.T) {
+	root := t.TempDir()
+	// Deliberately NOT the name claudeProjectDirName would derive.
+	proj := filepath.Join(root, "some-name-we-did-not-predict")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const id = "22222222-3333-4444-5555-666666666666"
+	if err := os.WriteFile(filepath.Join(proj, id+".jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !claudeSessionExistsUnder(root, "/Users/dev/some.dotted.dir", id) {
+		t.Error("the walk fallback did not run: a mis-derived project dir must not be reported as a missing session")
+	}
+	// And with no cwd at all there is nothing to derive, so the walk is the
+	// only path available.
+	if !claudeSessionExistsUnder(root, "", id) {
+		t.Error("an empty cwd must still find the transcript via the walk")
+	}
+}
+
+// TestClaudeProjectDirNameMatchesRealDirectories pins the rule against names
+// taken from an actual ~/.claude/projects: separators become dashes, and an
+// existing dash in the path survives (hence the doubled dash).
+func TestClaudeProjectDirNameMatchesRealDirectories(t *testing.T) {
+	cases := map[string]string{
+		"/Users/me/Development/huginn": "-Users-me-Development-huginn",
+		"/private/tmp":                 "-private-tmp",
+		"/private/tmp/-Users-me/x":     "-private-tmp--Users-me-x",
+		"/Users/me/Development/":       "-Users-me-Development",
+	}
+	for cwd, want := range cases {
+		if got := claudeProjectDirName(cwd); got != want {
+			t.Errorf("claudeProjectDirName(%q) = %q, want %q", cwd, got, want)
+		}
+	}
+	if got := claudeProjectDirName(""); got != "" {
+		t.Errorf("empty cwd = %q, want empty so the caller skips the fast path", got)
+	}
+}
+
+// TestClaudeHookCommandQuotesThePath: Claude Code runs the hook through a
+// shell, so an unquoted path with a space is split into two words and the hook
+// never runs — every gated tool silently stops working (fails closed, but
+// broken). "/Applications/My Apps/huginn" is an ordinary macOS path.
+func TestClaudeHookCommandQuotesThePath(t *testing.T) {
+	const spaced = "/Users/ada lovelace/bin/huginn"
+
+	posix := claudeHookCommand(spaced, "darwin", "")
+	if !strings.HasSuffix(posix, " claude-approve") {
+		t.Fatalf("hook command lost its subcommand: %q", posix)
+	}
+	// The shell must see ONE word for the binary. Strip the subcommand, then
+	// the surviving token has to be quoted as a unit.
+	quoted := strings.TrimSuffix(posix, " claude-approve")
+	if quoted != "'"+spaced+"'" {
+		t.Errorf("posix hook command = %q, want the path single-quoted as one word", posix)
+	}
+	if strings.HasPrefix(posix, "/Users/ada ") {
+		t.Error("path left unquoted: the shell would run /Users/ada with 'lovelace/bin/huginn' as an argument")
+	}
+
+	// An apostrophe in a path is legal on macOS and Linux and must not break
+	// out of the quoting.
+	tricky := claudeHookCommand("/Users/o'brien/huginn", "linux", "")
+	if tricky != `'/Users/o'\''brien/huginn' claude-approve` {
+		t.Errorf("single quote not escaped: %q", tricky)
+	}
+
+	win := claudeHookCommand(`C:\Program Files\Huginn\huginn.exe`, "windows", "")
+	if win != `"C:\Program Files\Huginn\huginn.exe" claude-approve` {
+		t.Errorf("windows hook command = %q, want the path double-quoted", win)
+	}
+
+	// A path with no space must still be quoted rather than special-cased:
+	// one rule is easier to keep correct than two.
+	plain := claudeHookCommand("/usr/local/bin/huginn", "darwin", "")
+	if plain != "'/usr/local/bin/huginn' claude-approve" {
+		t.Errorf("plain hook command = %q", plain)
+	}
+}
+
+func TestClaudeSessionIDsOf(t *testing.T) {
+	if got := claudeSessionIDsOf(nil); got != nil {
+		t.Errorf("nil config = %v, want nil", got)
+	}
+	cfg := &agentslib.AgentsConfig{Agents: []agentslib.AgentDef{
+		{Name: "Bound", ClaudeSessionID: "sess-1"},
+		{Name: "Native"},
+		{Name: "AlsoBound", ClaudeSessionID: "sess-2"},
+	}}
+	got := claudeSessionIDsOf(cfg)
+	if len(got) != 2 || got[0] != "sess-1" || got[1] != "sess-2" {
+		t.Fatalf("claudeSessionIDsOf = %v, want [sess-1 sess-2]", got)
+	}
+}
+
+func TestIsClaudeUUID(t *testing.T) {
+	good := []string{
+		"11111111-2222-3333-4444-555555555555",
+		"AABBCCDD-1122-4333-8444-abcdefABCDEF",
+	}
+	for _, s := range good {
+		if !isClaudeUUID(s) {
+			t.Errorf("isClaudeUUID(%q) = false, want true", s)
+		}
+	}
+	bad := map[string]string{
+		"":                                      "empty",
+		"not-a-uuid":                            "too short",
+		"11111111-2222-3333-4444-55555555555":   "35 chars",
+		"11111111-2222-3333-4444-5555555555555": "37 chars",
+		"1111111122223333-4444-555555555555":    "dash in the wrong place",
+		"1111111g-2222-3333-4444-555555555555":  "non-hex digit",
+		"11111111-2222-3333-4444-55555555555 ":  "trailing space",
+	}
+	for s, why := range bad {
+		if isClaudeUUID(s) {
+			t.Errorf("isClaudeUUID(%q) = true, want false (%s)", s, why)
+		}
+	}
+}
+
+// TestValidateClaudeBindingRejectsUnusableSessions: a bad binding produces
+// three unrelated-looking symptoms (no continuity, no serialisation, every
+// approval denied), so it has to be caught at the binding, with a message that
+// names the cause.
+func TestValidateClaudeBindingRejectsUnusableSessions(t *testing.T) {
+	if err := validateClaudeBinding("Codey", "11111111-2222-3333-4444-555555555555"); err != nil {
+		t.Fatalf("a valid binding was rejected: %v", err)
+	}
+
+	for _, id := range []string{"", "   "} {
+		err := validateClaudeBinding("Codey", id)
+		if err == nil {
+			t.Fatalf("empty session id %q accepted", id)
+		}
+		if !strings.Contains(err.Error(), "Codey") || !strings.Contains(err.Error(), "claude_session_id") {
+			t.Errorf("error must name the agent and the field: %v", err)
+		}
+	}
+
+	// A malformed id is treated exactly like a missing one: the CLI requires a
+	// UUID and the approval endpoint matches literally, so it fails the same
+	// three ways.
+	err := validateClaudeBinding("Codey", "session-one")
+	if err == nil {
+		t.Fatal("a non-UUID session id was accepted; Claude Code's --session-id would reject it with an opaque error instead")
+	}
+	if !strings.Contains(err.Error(), "session-one") {
+		t.Errorf("error must quote the offending value: %v", err)
+	}
+
+	// An unnamed agent must still produce a usable message.
+	if err := validateClaudeBinding("", ""); err == nil || !strings.Contains(err.Error(), "unnamed") {
+		t.Errorf("unnamed agent error = %v, want it to say so rather than quoting an empty name", err)
+	}
+}
+
+func TestClaudeBindingProblemsOnlyFlagsClaudeCodeAgents(t *testing.T) {
+	cfg := &agentslib.AgentsConfig{Agents: []agentslib.AgentDef{
+		{Name: "Tom", Provider: "anthropic"},                                  // not a claude-code agent: never flagged
+		{Name: "Bad", Provider: "claude-code"},                                // no session id
+		{Name: "Malformed", Provider: "claude-code", ClaudeSessionID: "nope"}, // not a UUID
+		{Name: "Good", Provider: "claude-code", ClaudeSessionID: "11111111-2222-3333-4444-555555555555"},
+	}}
+	got, warnings := claudeBindingProblems(cfg)
+	if len(got) != 2 {
+		t.Fatalf("claudeBindingProblems returned %d problems, want 2: %v", len(got), got)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("an unusable binding must be a problem, not a warning: %v", warnings)
+	}
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"Bad", "Malformed"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%q not reported: %v", want, got)
+		}
+	}
+	for _, unwanted := range []string{"Tom", "Good"} {
+		if strings.Contains(joined, `"`+unwanted+`"`) {
+			t.Errorf("%q reported but its binding is fine (or it is not a claude-code agent): %v", unwanted, got)
+		}
+	}
+	if p, w := claudeBindingProblems(nil); p != nil || w != nil {
+		t.Error("nil config must report no problems and no warnings")
+	}
+}
+
+// TestClaudeHookCommandCarriesTheBoundEndpoint pins Finding 2 at the build
+// site. The hook process must be TOLD where Huginn is, because it runs in a
+// separate process that would otherwise re-derive the port from config — and
+// config says 0 whenever the user asked for dynamic allocation.
+func TestClaudeHookCommandCarriesTheBoundEndpoint(t *testing.T) {
+	// A dynamically-allocated port: nothing in config could have produced this.
+	ep := claudeApproveEndpointFor("127.0.0.1:53412")
+	if ep != "http://127.0.0.1:53412/api/v1/claude/approve" {
+		t.Fatalf("claudeApproveEndpointFor = %q", ep)
+	}
+	if got := claudeApproveEndpointFor(""); got != "" {
+		t.Errorf("claudeApproveEndpointFor(\"\") = %q, want \"\" so the caller refuses instead of guessing a port", got)
+	}
+
+	posix := claudeHookCommand("/usr/local/bin/huginn", "darwin", ep)
+	if posix != "'/usr/local/bin/huginn' claude-approve --endpoint 'http://127.0.0.1:53412/api/v1/claude/approve'" {
+		t.Errorf("posix hook command = %q, want the real bound endpoint baked in", posix)
+	}
+	if strings.Contains(posix, ":0/") {
+		t.Error("hook command points at port 0: every gated tool would be denied 'Huginn unreachable'")
+	}
+
+	win := claudeHookCommand(`C:\Huginn\huginn.exe`, "windows", ep)
+	if !strings.Contains(win, `--endpoint "`+ep+`"`) {
+		t.Errorf("windows hook command = %q, want the endpoint quoted", win)
+	}
+
+	// The endpoint the hook is handed must be the one it actually parses back.
+	cmd := claudeHookCommand("/usr/local/bin/huginn", "darwin", ep)
+	fields := strings.Split(cmd, "--endpoint ")
+	if len(fields) != 2 {
+		t.Fatalf("hook command has no --endpoint: %q", cmd)
+	}
+	if got := endpointFromArgs([]string{"--endpoint", strings.Trim(fields[1], "'")}); got != ep {
+		t.Errorf("round-trip endpoint = %q, want %q", got, ep)
+	}
+}
+
+// TestClaudeCodeUnavailableNamesTheLimitation is the other half of Finding 5.
+// The TUI, --print, headless and `huginn --agent` paths run with no Huginn
+// server, so a claude-code agent's PreToolUse hook has no
+// /api/v1/claude/approve to ask. Before this, those paths either failed with an
+// opaque `backend: unknown provider "claude-code"` or (on the --agent path)
+// silently answered from an unrelated endpoint while wearing the agent's name.
+func TestClaudeCodeUnavailableNamesTheLimitation(t *testing.T) {
+	resolve := claudeCodeUnavailable("the interactive TUI")
+
+	b, claimed, err := resolve(&agentslib.Agent{Name: "Codey", Provider: "claude-code"})
+	if !claimed {
+		t.Fatal("declined a claude-code agent; it would fall through to `unknown provider \"claude-code\"`")
+	}
+	if err == nil {
+		t.Fatal("claimed the agent and returned no error — the caller would use a nil backend")
+	}
+	if b != nil {
+		t.Error("returned a backend for an agent that cannot run here")
+	}
+	for _, want := range []string{"Codey", "claude-code", "server mode", "the interactive TUI", "huginn serve"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q; an opaque message is what this replaces", err.Error(), want)
+		}
+	}
+
+	// Every other agent must be untouched: declining is a byte-for-byte no-op.
+	for _, ag := range []*agentslib.Agent{
+		nil,
+		{Name: "Tom", Provider: "anthropic"},
+		{Name: "Local", Provider: ""},
+	} {
+		if _, claimed, err := resolve(ag); claimed || err != nil {
+			t.Errorf("resolver claimed a non-claude-code agent %v (err=%v)", ag, err)
+		}
+	}
+}
+
+// TestClaudeBindingProblemsWarnsAboutToolNameSpelling: tool matching is exact,
+// everywhere — Huginn's toolAllowed and Claude Code's own hook matcher both use
+// string equality. So "bash" (the Huginn LocalTools spelling) or " Bash" (a
+// stray YAML space) matches nothing: an allowlist entry grants nothing and a
+// gated entry gates nothing, silently. One log line beats a total denial nobody
+// can diagnose.
+func TestClaudeBindingProblemsWarnsAboutToolNameSpelling(t *testing.T) {
+	cfg := &agentslib.AgentsConfig{Agents: []agentslib.AgentDef{{
+		Name:               "Codey",
+		Provider:           "claude-code",
+		ClaudeSessionID:    "b1f3c9d2-6e4a-4a11-9e0a-2f7d4c1a9b3e",
+		ClaudeAllowedTools: []string{"Read", "bash", " Bash"},
+		ClaudeGatedTools:   []string{"Write", "SomeFutureTool"},
+	}}}
+
+	hard, warn := claudeBindingProblems(cfg)
+	problems := strings.Join(warn, "\n")
+
+	// A misspelled tool name is a WARNING, never a hard problem: it is
+	// recoverable, and logging it at Error alongside a genuinely unusable
+	// binding trains people to skim past Error.
+	if len(hard) != 0 {
+		t.Errorf("a tool-name spelling issue was reported as a hard problem: %v", hard)
+	}
+
+	if strings.Contains(problems, `"Read"`) || strings.Contains(problems, `"Write"`) {
+		t.Errorf("a correctly-spelled tool was flagged:\n%s", problems)
+	}
+	if !strings.Contains(problems, `"bash"`) || !strings.Contains(problems, `should be "Bash"`) {
+		t.Errorf("lowercase \"bash\" not flagged; it matches nothing and denies everything:\n%s", problems)
+	}
+	if !strings.Contains(problems, "whitespace") {
+		t.Errorf("\" Bash\" not flagged for its leading space:\n%s", problems)
+	}
+	// Unknown names WARN but must never hard-fail: Claude Code's tool set grows.
+	if !strings.Contains(problems, "SomeFutureTool") {
+		t.Errorf("an unrecognised tool name produced no warning at all:\n%s", problems)
+	}
+	if !strings.Contains(problems, "WARNING, not a failure") {
+		t.Errorf("the unknown-name message must say it is not a failure:\n%s", problems)
+	}
+
+	// A native agent must never be touched by any of this.
+	native := &agentslib.AgentsConfig{Agents: []agentslib.AgentDef{{
+		Name: "Tom", Provider: "anthropic", LocalTools: []string{"bash", "*"},
+	}}}
+	if p, w := claudeBindingProblems(native); len(p) != 0 || len(w) != 0 {
+		t.Errorf("flagged a non-claude-code agent's LocalTools: %v %v", p, w)
+	}
+}

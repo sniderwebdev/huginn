@@ -26,6 +26,8 @@ func Migrations() []sqlitedb.Migration {
 		{Name: "cloud_vault_queue_v1", Up: migrateCloudVaultQueueV1},
 		{Name: "connections_refresh_error_columns_v1", Up: migrateConnectionsRefreshErrorColumnsV1},
 		{Name: "sessions_message_count_backfill_v1", Up: migrateSessionsMessageCountBackfillV1},
+		{Name: "sessions_external_columns_v1", Up: migrateSessionsExternalColumnsV1},
+		{Name: "claude_ingest_v1", Up: migrateClaudeIngestV1},
 	}
 }
 
@@ -499,4 +501,41 @@ func isFTSAlreadyExistsError(err error) bool {
 	return strings.Contains(msg, "already exists") ||
 		strings.Contains(msg, "table already exists") ||
 		strings.Contains(msg, "duplicate")
+}
+
+// migrateSessionsExternalColumnsV1 adds external_kind/external_id to the
+// sessions table on databases created before the Claude Code bridge, and
+// indexes the pair for reverse lookup. Uses ALTER TABLE ADD COLUMN rather
+// than a table rebuild: sessions has inbound foreign keys and migrations run
+// inside a transaction where PRAGMA foreign_keys cannot be toggled.
+func migrateSessionsExternalColumnsV1(tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE sessions ADD COLUMN external_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN external_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil && !isColumnAlreadyExistsError(err) {
+			return err
+		}
+	}
+	_, err := tx.Exec(`
+		CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_external
+			ON sessions(external_kind, external_id)
+			WHERE external_kind <> ''`)
+	return err
+}
+
+// migrateClaudeIngestV1 creates the claude_ingest table used to track resume
+// offsets when tailing a Claude Code session's transcript file.
+func migrateClaudeIngestV1(tx *sql.Tx) error {
+	_, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS claude_ingest (
+			external_id       TEXT    NOT NULL PRIMARY KEY,
+			huginn_session_id TEXT    NOT NULL,
+			path              TEXT    NOT NULL,
+			size              INTEGER NOT NULL DEFAULT 0,
+			byte_offset       INTEGER NOT NULL DEFAULT 0,
+			last_uuid         TEXT    NOT NULL DEFAULT '',
+			updated_at        INTEGER NOT NULL DEFAULT 0
+		)`)
+	return err
 }

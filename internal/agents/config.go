@@ -28,6 +28,29 @@ type AgentDef struct {
 	Endpoint     string `json:"endpoint,omitempty"     yaml:"endpoint,omitempty"`
 	APIKey       string `json:"api_key,omitempty"      yaml:"api_key,omitempty"`
 
+	// Claude Code provider binding. Set only when Provider == "claude-code".
+	// One agent is bound to exactly one Claude Code session for its lifetime.
+	ClaudeSessionID string `json:"claude_session_id,omitempty" yaml:"claude_session_id,omitempty"`
+	ClaudeCWD       string `json:"claude_cwd,omitempty"        yaml:"claude_cwd,omitempty"`
+
+	// ClaudeAllowedTools and ClaudeGatedTools hold Claude Code CLI tool names
+	// ("Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "Task", ...)
+	// — NOT Huginn's own builtin tool names (those live in LocalTools, e.g.
+	// "read_file", "bash", "web_search"). The two namespaces are disjoint and
+	// must never be conflated: LocalTools:["*"] means "all Huginn tools" and
+	// must not be read as authorising any Claude Code CLI tool.
+	//
+	// ClaudeGatedTools are the tools that always require a PreToolUse hook
+	// round-trip to Huginn (see internal/claudecode.BuildHookSettings); tools
+	// not listed there are pre-authorised via --allowedTools and never reach
+	// the hook at all. ClaudeAllowedTools is the allowlist the approval
+	// endpoint (POST /api/v1/claude/approve) checks a gated tool call against.
+	// Default-deny: empty/nil grants nothing. No wildcard is supported here —
+	// this gate protects an unattended agent, so it must never be one
+	// character away from "allow everything".
+	ClaudeAllowedTools []string `json:"claude_allowed_tools,omitempty" yaml:"claude_allowed_tools,omitempty"`
+	ClaudeGatedTools   []string `json:"claude_gated_tools,omitempty"   yaml:"claude_gated_tools,omitempty"`
+
 	// VaultName is the fully-qualified MuninnDB vault name for this agent.
 	// If empty, defaults to "huginn:agent:<username>:<agentname>".
 	VaultName string `json:"vault_name,omitempty"   yaml:"vault_name,omitempty"`
@@ -104,11 +127,11 @@ type AgentDef struct {
 
 	// HeartbeatEnabled controls whether this agent sends periodic check-in DMs to the user.
 	// When true, a workflow YAML is auto-generated at ~/.huginn/workflows/heartbeat-{name}.yaml.
-	HeartbeatEnabled bool   `json:"heartbeat_enabled,omitempty" yaml:"heartbeat_enabled,omitempty"`
+	HeartbeatEnabled bool `json:"heartbeat_enabled,omitempty" yaml:"heartbeat_enabled,omitempty"`
 
 	// HeartbeatCron is the cron schedule for the heartbeat workflow.
 	// Defaults to "0 */4 * * *" (every 4 hours) when empty and HeartbeatEnabled is true.
-	HeartbeatCron    string `json:"heartbeat_cron,omitempty"    yaml:"heartbeat_cron,omitempty"`
+	HeartbeatCron string `json:"heartbeat_cron,omitempty"    yaml:"heartbeat_cron,omitempty"`
 
 	// Version is an optimistic-lock counter incremented on every save.
 	// On PUT /api/v1/agents/{name}: if the client sends Version > 0 and it does
@@ -209,10 +232,10 @@ func (d *AgentDef) DeriveMemoryType() {
 // validPlasticity contains the recognized plasticity values.
 // Empty string is allowed and defaults to "default" at runtime.
 var validPlasticity = map[string]bool{
-	"":               true,
-	"default":        true,
+	"":                true,
+	"default":         true,
 	"knowledge-graph": true,
-	"reference":      true,
+	"reference":       true,
 }
 
 // validMemoryMode contains the recognized memory_mode values.
@@ -313,17 +336,21 @@ func FromDef(def AgentDef) *Agent {
 		memEnabled = *def.MemoryEnabled
 	}
 	return &Agent{
-		Name:          def.Name,
-		ModelID:       def.Model,
-		Provider:      def.Provider,
-		Endpoint:      def.Endpoint,
-		APIKey:        def.APIKey,
-		SystemPrompt:  def.SystemPrompt,
-		Color:         def.Color,
-		Icon:          def.Icon,
-		IsDefault:     def.IsDefault,
-		VaultName:     def.VaultName,
-		Plasticity:    def.Plasticity,
+		Name:                def.Name,
+		ModelID:             def.Model,
+		Provider:            def.Provider,
+		Endpoint:            def.Endpoint,
+		APIKey:              def.APIKey,
+		ClaudeSessionID:     def.ClaudeSessionID,
+		ClaudeCWD:           def.ClaudeCWD,
+		ClaudeAllowedTools:  def.ClaudeAllowedTools,
+		ClaudeGatedTools:    def.ClaudeGatedTools,
+		SystemPrompt:        def.SystemPrompt,
+		Color:               def.Color,
+		Icon:                def.Icon,
+		IsDefault:           def.IsDefault,
+		VaultName:           def.VaultName,
+		Plasticity:          def.Plasticity,
 		MemoryEnabled:       memEnabled,
 		ContextNotesEnabled: def.ContextNotesEnabled,
 		MemoryMode:          def.MemoryMode,

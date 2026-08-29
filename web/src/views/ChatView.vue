@@ -983,6 +983,16 @@
         </div>
       </div>
 
+      <!-- ── Pending Claude tool approvals ──────────────────────── -->
+      <div v-if="visibleApprovals.length > 0" class="px-4 pb-2 flex flex-col gap-1.5">
+        <ClaudeApprovalCard
+          v-for="approval in visibleApprovals"
+          :key="approval.id"
+          :approval="approval"
+          @decide="d => onApprovalDecide(approval.id, d)"
+        />
+      </div>
+
       <!-- ── Swarm status panel ─────────────────────────────────── -->
       <Transition
         enter-active-class="transition-all duration-200 ease-out"
@@ -1288,6 +1298,8 @@ import AgentMessageHeader from '../components/AgentMessageHeader.vue'
 import MsgTimeReveal from '../components/MsgTimeReveal.vue'
 import MessageActions from '../components/MessageActions.vue'
 import SystemFailLine from '../components/SystemFailLine.vue'
+import ClaudeApprovalCard from '../components/ClaudeApprovalCard.vue'
+import { useClaudeApprovals, type ApprovalDecision } from '../composables/useClaudeApprovals'
 import type { HuginnWS, WSMessage } from '../composables/useHuginnWS'
 import { api, apiFetch, type FileDiff } from '../composables/useApi'
 import MemoryVaultChip from '../components/MemoryVaultChip.vue'
@@ -1426,6 +1438,19 @@ let previewTicker: ReturnType<typeof setInterval> | null = null
 
 const autoApproveNotices = ref<{ id: string; agentName: string }[]>([])
 const autoApproveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+// Cards belong to the conversation whose agent raised them. `approvals` is a
+// module-level singleton shared with App.vue (which owns fetching/refresh —
+// see App.vue's websocket + reconnect wiring), so this view only renders.
+// The filter itself — including the fallback that shows ALL approvals when no
+// agent is selected yet — lives in approvalsFor, so it is written and tested
+// once rather than reimplemented here.
+const { approvalsFor: claudeApprovalsFor, decide: decideApproval } = useClaudeApprovals()
+const visibleApprovals = computed(() => claudeApprovalsFor(selectedAgentName.value))
+
+async function onApprovalDecide(id: string, d: ApprovalDecision): Promise<void> {
+  await decideApproval(id, d)
+}
 
 function showAutoApproveNotice(agentName: string) {
   const id = `aa-${Date.now()}`

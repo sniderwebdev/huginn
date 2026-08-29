@@ -45,6 +45,10 @@ type Agent struct {
 	Provider            string
 	Endpoint            string
 	APIKey              string
+	ClaudeSessionID     string
+	ClaudeCWD           string
+	ClaudeAllowedTools  []string // Claude Code CLI tool names (e.g. "Bash", "Write"), NOT Huginn's LocalTools namespace; default-deny, no wildcard
+	ClaudeGatedTools    []string // Claude Code CLI tool names that always require an approval round-trip
 	History             []backend.Message
 	VaultName           string
 	Plasticity          string
@@ -132,6 +136,8 @@ func (a *Agent) cloneUnlocked() Agent {
 		Provider:            a.Provider,
 		Endpoint:            a.Endpoint,
 		APIKey:              a.APIKey,
+		ClaudeSessionID:     a.ClaudeSessionID,
+		ClaudeCWD:           a.ClaudeCWD,
 		VaultName:           a.VaultName,
 		Plasticity:          a.Plasticity,
 		MemoryEnabled:       a.MemoryEnabled,
@@ -140,10 +146,12 @@ func (a *Agent) cloneUnlocked() Agent {
 		VaultDescription:    a.VaultDescription,
 		// Clone slice-backed fields so request-scoped copies never alias shared
 		// registry state under concurrent workflow execution.
-		Toolbelt:      append([]ToolbeltEntry(nil), a.Toolbelt...),
-		Skills:        append([]string(nil), a.Skills...),
-		LocalTools:    append([]string(nil), a.LocalTools...),
-		ApprovedTools: append([]string(nil), a.ApprovedTools...),
+		Toolbelt:           append([]ToolbeltEntry(nil), a.Toolbelt...),
+		Skills:             append([]string(nil), a.Skills...),
+		LocalTools:         append([]string(nil), a.LocalTools...),
+		ApprovedTools:      append([]string(nil), a.ApprovedTools...),
+		ClaudeAllowedTools: append([]string(nil), a.ClaudeAllowedTools...),
+		ClaudeGatedTools:   append([]string(nil), a.ClaudeGatedTools...),
 		// History is intentionally not copied — the copy is request-scoped.
 	}
 }

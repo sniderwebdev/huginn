@@ -24,6 +24,10 @@ Find what you need by what you want to do.
 → [Memory](features/memory.md) — context notes and MuninnDB cross-session memory
 → [Notepad](features/notepad.md) — inject standing project context into every session
 
+## If you want Claude Code terminal sessions inside Huginn
+→ [Claude Code Bridge](features/claude-code-bridge.md) — watch Claude Code sessions live, delegate tasks to `claude -p`
+→ [Claude Code Agents](features/claude-code-agents.md) — an agent that IS a Claude Code session, with Huginn's rules and approvals
+
 ## If you want to teach agents new behaviors
 → [Skills](features/skills.md) — SKILL.md files, system prompt injection, skill tools
 
