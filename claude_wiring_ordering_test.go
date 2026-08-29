@@ -268,10 +268,6 @@ func TestEveryOrchestratorInstallsAClaudeCodeResolver(t *testing.T) {
 			"delegated sub-threads (@Codey, delegate_to_agent): the four-tuple resolver cannot express a session binding, so this fails with `unknown provider \"claude-code\"`"},
 		{resolverInstall{"main", "orch", "SetAgentBackendOverride"},
 			"the interactive TUI: without it the failure is an opaque `unknown provider` instead of a message naming the server-mode limitation"},
-		{resolverInstall{"main", "printOrch", "SetAgentBackendOverride"},
-			"--print"},
-		{resolverInstall{"main", "hlOrch", "SetAgentBackendOverride"},
-			"headless mode"},
 	}
 	for _, req := range required {
 		if !found[req.site] {
@@ -280,36 +276,45 @@ func TestEveryOrchestratorInstallsAClaudeCodeResolver(t *testing.T) {
 		}
 	}
 
-	// The `huginn --agent <name>` path builds an ExternalBackend directly and
-	// never consults ag.Provider, so it cannot install a resolver — it calls
-	// claudeCodeUnavailable inline instead. Without that call a claude-code
-	// agent is silently answered by an unrelated endpoint wearing its name,
-	// with none of its session, tools or approval gate.
+	// The headless and --print/--agent paths USED to build their own
+	// orchestrators (hlOrch, printOrch) and install the resolver on each. They
+	// no longer exist: internal/oneshot owns an orchestrator internally and
+	// exposes no backend-override seam, so the resolver cannot be installed
+	// there at all. Those paths apply the same rule by name instead, before
+	// calling oneshot.Run.
 	//
-	// Its signature there is distinctive — the resolver is BUILT and then
-	// IMMEDIATELY APPLIED, `claudeCodeUnavailable(mode)(ag)` — which is what
-	// this looks for, so the three installs above cannot stand in for it.
+	// Without those calls a claude-code agent is answered by whatever generic
+	// backend is configured — wearing that agent's name, with none of its
+	// session, tools or approval gate. That is the same failure the deleted
+	// resolver installs prevented, so this check replaces them rather than
+	// relaxing anything.
+	//
+	// Each mode is matched on its literal string, so deleting either call site
+	// fails here instead of silently widening the gate.
 	_, f := mainSource(t)
 	mainFn := funcNamed(t, f, "main")
-	applied := false
+	guarded := map[string]bool{}
 	ast.Inspect(mainFn, func(n ast.Node) bool {
-		outer, ok := n.(*ast.CallExpr)
-		if !ok {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || callName(call) != "claudeCodeAgentGuard" || len(call.Args) < 2 {
 			return true
 		}
-		inner, ok := outer.Fun.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if callName(inner) == "claudeCodeUnavailable" {
-			applied = true
+		if lit, ok := call.Args[1].(*ast.BasicLit); ok {
+			guarded[strings.Trim(lit.Value, `"`)] = true
 		}
 		return true
 	})
-	if !applied {
-		t.Error("main() never applies claudeCodeUnavailable to an agent: " +
-			"`huginn --agent Codey` builds an ExternalBackend directly and never reads ag.Provider, " +
-			"so it would answer from an unrelated endpoint wearing that agent's name")
+	for _, mode := range []string{
+		"headless mode",
+		"`huginn --print` / `huginn --agent`",
+	} {
+		if !guarded[mode] {
+			t.Errorf("main() never calls claudeCodeAgentGuard(%q).\n"+
+				"That path runs through oneshot.Run, which builds its own orchestrator and takes no "+
+				"backend-override resolver, so this by-name guard is the ONLY thing stopping a "+
+				"claude-code agent being answered by an unrelated backend wearing its name.\n"+
+				"Guarded modes found: %v", mode, guarded)
+		}
 	}
 }
 

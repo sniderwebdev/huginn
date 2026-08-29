@@ -54,6 +54,16 @@ type PermissionRequest struct {
 	Args     map[string]any
 	Summary  string // human-readable one-liner
 	Provider string // provider tag from tool registry; empty if untagged
+
+	// AgentName and SessionID identify which agent/session originated this
+	// request. Populated by RunLoop and the per-agent tool executors so a
+	// promptFunc bridging to a UI (serve mode's WS permission_request flow)
+	// can target the right session and offer a per-agent "always allow"
+	// grant. Both are optional — empty when the caller doesn't have this
+	// context (e.g. legacy call sites), in which case the bridge falls back
+	// to session-only behavior.
+	AgentName string
+	SessionID string
 }
 
 const (
@@ -61,6 +71,7 @@ const (
 	ReasonPromptUnavailable  = "prompt_unavailable"
 	ReasonPromptTimeout      = "prompt_timeout"
 	ReasonUserDenied         = "user_denied"
+	ReasonCancelled          = "cancelled"
 )
 
 // CheckResult describes a gate decision with machine-readable denial context.
@@ -75,7 +86,7 @@ type Gate struct {
 	mu               sync.Mutex
 	skipAll          bool            // --dangerously-skip-permissions
 	watchedProviders map[string]bool // prompt for these even in skipAll mode
-	allowedProviders map[string]bool // nil = all providers allowed; non-nil = toolbelt restriction
+	allowedProviders map[string]bool // nil = unrestricted (legacy); empty = deny external; {"*":true} = explicit allow-all
 	sessionAllowed   map[string]bool // tool name → always allow this session
 	sessionOrder     []string        // kept for backwards compat; unused when lruList is non-nil
 	// lruList is the doubly-linked list for true LRU eviction (front = MRU, back = LRU).
@@ -83,6 +94,31 @@ type Gate struct {
 	// lruItems maps tool name → *list.Element for O(1) touch/eviction.
 	lruItems   map[string]*list.Element
 	promptFunc func(PermissionRequest) Decision
+	// promptFuncCtx is an optional context-aware variant of promptFunc. When
+	// set, CheckDetailedCtx calls it instead of promptFunc, passing through
+	// the caller's context so the bridge (e.g. server mode's WS round trip)
+	// can itself stop blocking on cancellation rather than only being
+	// abandoned by the gate. Set via SetPromptFuncCtx; promptFunc remains the
+	// fallback for callers that never wire a ctx-aware bridge.
+	promptFuncCtx func(context.Context, PermissionRequest) Decision
+
+	// execRequiresPrompt makes PermExec-level requests (bash) fall through to
+	// promptFunc even when skipAll is true. Unlike watchedProviders (which is
+	// keyed by connection provider), this applies to every PermExec tool
+	// regardless of provider — bash is untagged (Provider == "") so it would
+	// otherwise never hit watchedProviders. Set via SetExecRequiresPrompt.
+	execRequiresPrompt bool
+
+	// execPromptExempt names PermExec-level tools that execRequiresPrompt must
+	// NOT route to promptFunc. PermExec is a coarse level: it covers tools that
+	// really do run code (bash, run_tests, skill binaries) but also
+	// delegate_to_agent, which runs no code of its own and already has its own
+	// approval UX (threadmgr.DelegationPreviewGate). Without this exemption,
+	// turning on execRequiresPrompt makes every delegation raise a second,
+	// redundant permission banner — and makes delegation impossible in any
+	// run with no human attached. The delegated agent's own bash calls are
+	// still gated: they go through that agent's forked gate.
+	execPromptExempt map[string]bool
 
 	// relayChans holds in-flight relay permission requests.
 	// Each entry pairs the response channel with its registration time so the
@@ -214,8 +250,90 @@ func (g *Gate) SetWatchedProviders(providers map[string]bool) {
 	}
 }
 
+// SetPromptFunc (re)binds the gate's prompt callback. Used for late binding
+// when the UI bridge (e.g. serve mode's WS hub) isn't constructed yet at
+// NewGate time. Safe to call concurrently; takes effect on the next Check.
+func (g *Gate) SetPromptFunc(fn func(PermissionRequest) Decision) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.promptFunc = fn
+}
+
+// SetPromptFuncCtx (re)binds the gate's context-aware prompt callback.
+// CheckDetailedCtx prefers this over the plain promptFunc set via
+// SetPromptFunc so a cancelled caller context can propagate into the bridge
+// itself (e.g. the server mode WS round trip) instead of only being
+// abandoned by the gate. Safe to call concurrently; takes effect on the next
+// CheckDetailedCtx.
+func (g *Gate) SetPromptFuncCtx(fn func(context.Context, PermissionRequest) Decision) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.promptFuncCtx = fn
+}
+
+// SetExecRequiresPrompt controls whether PermExec-level tool calls (bash)
+// always fall through to promptFunc, even when skipAll is true. Serve mode
+// sets this so bash requires human approval by default while other
+// PermWrite tools remain auto-approved (skipAll's existing behavior).
+func (g *Gate) SetExecRequiresPrompt(require bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.execRequiresPrompt = require
+}
+
+// SetExecPromptExempt names PermExec-level tools that SetExecRequiresPrompt
+// must not prompt for. See the execPromptExempt field for why this exists.
+// Replaces any previous set; an empty list clears it. Inherited by Fork.
+func (g *Gate) SetExecPromptExempt(toolNames []string) {
+	exempt := make(map[string]bool, len(toolNames))
+	for _, name := range toolNames {
+		if name != "" {
+			exempt[name] = true
+		}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.execPromptExempt = exempt
+}
+
+// SeedSessionAllowed marks the given tool names as already allowed for this
+// gate's lifetime, without going through promptFunc. Used to pre-seed a
+// per-agent-run forked gate from a persisted "always allow" grant
+// (AgentDef.ApprovedTools) so previously-approved tools don't re-prompt.
+func (g *Gate) SeedSessionAllowed(toolNames []string) {
+	if len(toolNames) == 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, name := range toolNames {
+		if name == "" || g.sessionAllowed[name] {
+			continue
+		}
+		// "*" is the MJ "approve everything for this agent" wildcard grant
+		// (approved_tools: ["*"]) — it suppresses exec prompting for every
+		// tool on this forked gate, honored in checkSessionAllowed.
+		g.sessionAllowed[name] = true
+		g.lruTouch(name)
+	}
+}
+
+// sessionAllowedFor reports whether toolName is covered by a session/seeded
+// grant, honoring the "*" wildcard. Callers must hold g.mu.
+func (g *Gate) sessionAllowedFor(toolName string) bool {
+	return g.sessionAllowed[toolName] || g.sessionAllowed["*"]
+}
+
 // SetAllowedProviders configures the set of connection providers whose tools
-// this gate will allow. Pass nil to allow all providers (no toolbelt restriction).
+// this gate will allow.
+//
+//   - nil: no toolbelt restriction (legacy / gate not yet scoped to an agent)
+//   - empty map: deny every tagged external provider (fail closed)
+//   - {"*": true}: explicit allow-all, same as a toolbelt wildcard
+//   - named keys: only those providers
+//
+// Auto-approve (skipAll) is independent of this set. skipAll skips the
+// approval prompt; it does not grant providers the agent was not given.
 func (g *Gate) SetAllowedProviders(providers map[string]bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -238,6 +356,12 @@ func (g *Gate) Fork(watchedProviders, allowedProviders map[string]bool) *Gate {
 	}
 	skipAll := g.skipAll
 	promptFunc := g.promptFunc
+	promptFuncCtx := g.promptFuncCtx
+	execRequiresPrompt := g.execRequiresPrompt
+	// Share the exempt set by value: it is replaced wholesale by
+	// SetExecPromptExempt, never mutated in place, so a copy of the map
+	// header is safe and keeps Fork cheap.
+	execPromptExempt := g.execPromptExempt
 	// Copy LRU order: iterate front-to-back (MRU to LRU).
 	newList := list.New()
 	newItems := make(map[string]*list.Element, g.lruList.Len())
@@ -253,15 +377,18 @@ func (g *Gate) Fork(watchedProviders, allowedProviders map[string]bool) *Gate {
 		watchedProviders = make(map[string]bool)
 	}
 	child := &Gate{
-		skipAll:          skipAll,
-		watchedProviders: watchedProviders,
-		allowedProviders: allowedProviders,
-		sessionAllowed:   sessionCopy,
-		lruList:          newList,
-		lruItems:         newItems,
-		promptFunc:       promptFunc,
-		relayChans:       make(map[string]relayEntry),
-		sweepDone:        make(chan struct{}),
+		skipAll:            skipAll,
+		watchedProviders:   watchedProviders,
+		allowedProviders:   allowedProviders,
+		sessionAllowed:     sessionCopy,
+		lruList:            newList,
+		lruItems:           newItems,
+		promptFunc:         promptFunc,
+		promptFuncCtx:      promptFuncCtx,
+		execRequiresPrompt: execRequiresPrompt,
+		execPromptExempt:   execPromptExempt,
+		relayChans:         make(map[string]relayEntry),
+		sweepDone:          make(chan struct{}),
 	}
 	child.startSweep()
 	return child
@@ -337,16 +464,32 @@ func (g *Gate) Check(req PermissionRequest) bool {
 }
 
 // CheckDetailed returns the gate decision plus denial reason metadata.
-// Callers that only need a bool can use Check.
+// Callers that only need a bool can use Check. Equivalent to
+// CheckDetailedCtx(context.Background(), req) — a background context never
+// cancels, so this behaves exactly as before ctx support was added.
 func (g *Gate) CheckDetailed(req PermissionRequest) CheckResult {
+	return g.CheckDetailedCtx(context.Background(), req)
+}
+
+// CheckDetailedCtx is CheckDetailed with a caller context threaded through
+// the promptFunc wait. When ctx is cancelled while a permission prompt is
+// pending (e.g. a chat_cancel arrives mid-prompt), the wait unblocks
+// immediately with ReasonCancelled instead of waiting out the full
+// promptFuncTimeout. If a context-aware bridge was wired via
+// SetPromptFuncCtx, ctx is also passed into it so the bridge itself (e.g.
+// the server's WS round trip) can stop blocking rather than being merely
+// abandoned here.
+func (g *Gate) CheckDetailedCtx(ctx context.Context, req PermissionRequest) CheckResult {
 	// Toolbelt enforcement: reject calls from providers not in the allowed set.
-	// Only applies when allowedProviders is non-nil (agent has an explicit toolbelt)
-	// and req.Provider is non-empty (connection tool, not an internal tool).
+	// Applies when allowedProviders is non-nil (an agent-scoped gate) and
+	// req.Provider is non-empty (connection tool, not an untagged builtin).
+	// An empty map fails closed. provider "*" is an explicit allow-all.
+	// skipAll does not bypass this check — auto-approve is not allow-all-providers.
 	if req.Provider != "" {
 		g.mu.Lock()
 		allowed := g.allowedProviders
 		g.mu.Unlock()
-		if allowed != nil && !allowed[req.Provider] {
+		if allowed != nil && !allowed[req.Provider] && !allowed["*"] {
 			return CheckResult{
 				Allowed:    false,
 				ReasonCode: ReasonProviderNotAllowed,
@@ -363,22 +506,25 @@ func (g *Gate) CheckDetailed(req PermissionRequest) CheckResult {
 	if g.skipAll {
 		g.mu.Lock()
 		watched := g.watchedProviders[req.Provider]
+		execGate := g.execRequiresPrompt && req.Level == tools.PermExec && !g.execPromptExempt[req.ToolName]
 		g.mu.Unlock()
-		if !watched {
+		if !watched && !execGate {
 			return CheckResult{Allowed: true}
 		}
-		// Fall through to prompt for watched providers
+		// Fall through to prompt for watched providers / gated exec tools.
 	}
 	g.mu.Lock()
 	// Check session allow-list
-	if g.sessionAllowed[req.ToolName] {
+	if g.sessionAllowedFor(req.ToolName) {
 		g.mu.Unlock()
 		return CheckResult{Allowed: true}
 	}
+	promptFunc := g.promptFunc
+	promptFuncCtx := g.promptFuncCtx
 	g.mu.Unlock()
 
 	// No prompt function — deny by default
-	if g.promptFunc == nil {
+	if promptFunc == nil && promptFuncCtx == nil {
 		return CheckResult{
 			Allowed:    false,
 			ReasonCode: ReasonPromptUnavailable,
@@ -388,11 +534,17 @@ func (g *Gate) CheckDetailed(req PermissionRequest) CheckResult {
 
 	// Call promptFunc with a timeout. If it doesn't respond within
 	// promptFuncTimeout, treat as denied (safe default) and log a warning.
+	// Prefer the context-aware bridge when one is wired so cancellation can
+	// unblock the bridge itself (e.g. the server's WS round trip), not just
+	// this wait.
 	type result struct{ d Decision }
 	ch := make(chan result, 1)
-	pf := g.promptFunc
 	go func() {
-		ch <- result{pf(req)}
+		if promptFuncCtx != nil {
+			ch <- result{promptFuncCtx(ctx, req)}
+			return
+		}
+		ch <- result{promptFunc(req)}
 	}()
 
 	var decision Decision
@@ -409,12 +561,20 @@ func (g *Gate) CheckDetailed(req PermissionRequest) CheckResult {
 			ReasonCode: ReasonPromptTimeout,
 			Reason:     "Permission request timed out.",
 		}
+	case <-ctx.Done():
+		slog.Info("permissions: request cancelled while prompt pending, denying",
+			"tool", req.ToolName)
+		return CheckResult{
+			Allowed:    false,
+			ReasonCode: ReasonCancelled,
+			Reason:     "Permission request was cancelled.",
+		}
 	}
 
 	switch decision {
 	case AllowAll:
 		g.mu.Lock()
-		if !g.sessionAllowed[req.ToolName] {
+		if !g.sessionAllowedFor(req.ToolName) {
 			g.sessionAllowed[req.ToolName] = true
 			g.lruTouch(req.ToolName)
 			// Evict LRU entry when cap is exceeded (evict exactly one entry).

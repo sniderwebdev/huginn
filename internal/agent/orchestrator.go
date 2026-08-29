@@ -53,6 +53,20 @@ func GetParentMessageID(ctx context.Context) string {
 	return v
 }
 
+type spaceIDCtxKey struct{}
+
+// SetSpaceID attaches the space ID so delegate_to_agent can bind Create
+// to desk-mesh / roster membership even when the orch session is ephemeral.
+func SetSpaceID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, spaceIDCtxKey{}, id)
+}
+
+// GetSpaceID retrieves the space ID set by SetSpaceID. Returns "" if not set.
+func GetSpaceID(ctx context.Context) string {
+	v, _ := ctx.Value(spaceIDCtxKey{}).(string)
+	return v
+}
+
 // State represents the orchestrator's current phase.
 type State int
 
@@ -97,9 +111,13 @@ type Orchestrator struct {
 	workspaceRoot        string                // set by SetGitRoot; used to load .huginn.md project instructions
 	huginnHome           string                // set by SetHuginnHome; used to locate agent memory files
 	skillsReg            *skills.SkillRegistry // set by SetSkillsRegistry; used for per-agent skill injection
+	hooks                *HookRegistry         // PreToolUse/PostToolUse chain (G10); nil until SetHooks. Carries G1 syntax validation.
 
 	// defaultModel is the fallback model name when no agent registry is configured.
 	defaultModel string
+
+	// defaultMaxTurns caps ChatWithAgent's RunLoop. 0 means the loop default (50).
+	defaultMaxTurns int
 
 	// sessionStore is the persistent session store for history hydration.
 	sessionStore huginsession.StoreInterface
@@ -120,8 +138,22 @@ type Orchestrator struct {
 	// memoryPrefetchCache caches MuninnDB memory briefing results per agent/session key.
 	memoryPrefetchCache *prefetchCache
 
+	// vaultNegCache remembers a failed/unconfigured vault connect per agent
+	// name for vaultNegativeCacheTTL, so connectAgentVault does not
+	// re-attempt config load + connect on every single turn. Scoped to the
+	// Orchestrator instance (not a package-level var) so two orchestrators
+	// — or two tests — never leak cached failures into each other.
+	vaultNegCache map[string]vaultNegativeCacheEntry
+
 	// semanticPrefetchCache caches semantic search results per query key.
 	semanticPrefetchCache *prefetchCache
+
+	// memoryGuided records immersive muninn_guide session keys (once per session).
+	memoryGuided sync.Map
+
+	// memoryPulled tracks session-start / last-topic pull so conversational
+	// and passive modes do not MCP-call every sentence.
+	memoryPulled sync.Map
 
 	// optionals groups optional integrations so future wiring can evolve without
 	// expanding the top-level mutable surface area.
@@ -320,11 +352,8 @@ func (o *Orchestrator) CodeWithAgent(
 	vr := o.connectAgentVault(ctx, ag, reg)
 	defer vr.cancel()
 
-	if vr.warning != "" && onEvent != nil {
-		onEvent(backend.StreamEvent{
-			Type:    backend.StreamWarning,
-			Content: fmt.Sprintf("\u26a0\ufe0f Memory vault unavailable: %s. Memory features are disabled for this session.", vr.warning),
-		})
+	if vr.warning != "" {
+		logVaultUnavailable(ag.Name, "", vr.warning)
 	}
 
 	ctxText := o.contextBuilder.Build(userMsg, o.defaultModelName())
@@ -358,6 +387,7 @@ func (o *Orchestrator) CodeWithAgent(
 		return agCodeErr
 	}
 	cfg := RunLoopConfig{
+		Hooks:              o.toolHooks(),
 		MaxTurns:           maxTurns,
 		Messages:           messages,
 		Tools:              vr.sessionReg,
@@ -371,6 +401,8 @@ func (o *Orchestrator) CodeWithAgent(
 		OnPermissionDenied: onPermDenied,
 		OnEvent:            onEvent,
 		VaultReconnector:   vr.reconnector,
+		AgentName:          ag.Name,
+		SessionID:          GetSessionID(ctx),
 	}
 
 	agentLoopStart := time.Now().UnixNano()
@@ -389,7 +421,7 @@ func (o *Orchestrator) CodeWithAgent(
 			backend.Message{Role: "assistant", Content: loopResult.FinalContent},
 		)
 	}
-	o.compactHistory(ctx, sess)
+	o.compactHistoryAsync(sess)
 	return nil
 }
 

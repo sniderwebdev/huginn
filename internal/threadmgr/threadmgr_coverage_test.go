@@ -138,7 +138,7 @@ func TestDelegateToAgentTool_Execute_WithDependsOnAndFileIntents(t *testing.T) {
 	result := d.Execute(context.Background(), map[string]any{
 		"agent":        "Stacy",
 		"task":         "refactor",
-		"depends_on":   []any{"Alice", ""},    // empty string should be skipped
+		"depends_on":   []any{"Alice", ""},   // empty string should be skipped
 		"file_intents": []any{"main.go", ""}, // empty string should be skipped
 	})
 	if result.IsError {
@@ -206,6 +206,26 @@ func TestBuildPersonaContent_AgentFound(t *testing.T) {
 	got := buildPersonaContent(thread, reg)
 	if !strings.Contains(got, "implement auth") {
 		t.Errorf("expected task in output, got %q", got)
+	}
+	if !strings.Contains(got, "Local time now:") {
+		t.Errorf("delegate child persona must inject Local time now:, got %q", got)
+	}
+	if !strings.Contains(got, " ET") {
+		t.Errorf("clock must be timezone-labeled ET, got %q", got)
+	}
+}
+
+func TestBuildPersonaContent_LocalClockET(t *testing.T) {
+	thread := &Thread{AgentID: "Winston", Task: "what time it is"}
+	got := buildPersonaContent(thread, nil)
+	if !strings.Contains(got, "Local time now:") {
+		t.Fatalf("missing clock line: %q", got)
+	}
+	if !strings.Contains(got, " ET") {
+		t.Fatalf("clock must be timezone-labeled ET: %q", got)
+	}
+	if strings.Contains(got, "EDT") || strings.Contains(got, "EST") {
+		t.Fatalf("label must be ET: %q", got)
 	}
 }
 
@@ -433,7 +453,8 @@ func TestCreateFromMentions_SpawnsThread(t *testing.T) {
 		broadcast,
 		ca,
 		tm,
-		"", // callerAgent: empty for this test
+		"",  // callerAgent: empty for this test
+		nil, // spaceMemberNames: standalone, all-agents
 	)
 
 	// Wait a bit for the spawned goroutine to complete.
@@ -477,7 +498,8 @@ func TestCreateFromMentions_UnknownAgent_NoThread(t *testing.T) {
 		broadcast,
 		ca,
 		tm,
-		"", // callerAgent: empty for this test
+		"",  // callerAgent: empty for this test
+		nil, // spaceMemberNames: standalone, all-agents
 	)
 
 	threads := tm.ListBySession(sess.ID)
@@ -513,7 +535,8 @@ func TestCreateFromMentions_ThreadLimitExceeded_Skips(t *testing.T) {
 		broadcast,
 		ca,
 		tm,
-		"", // callerAgent: empty for this test
+		"",  // callerAgent: empty for this test
+		nil, // spaceMemberNames: standalone, all-agents
 	)
 
 	// Coder thread should NOT have been created (limit exceeded).
@@ -832,8 +855,8 @@ func TestRunOnce_UnknownTool(t *testing.T) {
 
 // sequenceBackend returns scripted responses in order.
 type sequenceBackend struct {
-	mu    sync.Mutex
-	calls int
+	mu        sync.Mutex
+	calls     int
 	responses []*backend.ChatResponse
 }
 

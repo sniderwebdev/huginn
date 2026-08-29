@@ -41,6 +41,18 @@ type PersistedToolCall struct {
 	Name   string         `json:"name"`
 	Args   map[string]any `json:"args,omitempty"`
 	Result string         `json:"result,omitempty"`
+	// Diff carries a before/after unified diff for write-path tools
+	// (write_file, edit_file) that changed a file — see
+	// tools.BuildFileDiff / attachDiffMetadata. Shape matches the
+	// "diff" key written into ToolResult.Metadata:
+	// {path, unified, added, removed, truncated, is_new, is_delete}.
+	// Left nil for tool calls that didn't change a file.
+	Diff map[string]any `json:"diff,omitempty"`
+	// ChecksStatus is the authoritative CI-checks state from a
+	// gh_pr_checks/glab_mr_checks call ("passed"|"pending"|"failed"),
+	// lifted from ToolResult.Metadata["status"] so the PR card renders the
+	// real state instead of a keyword-guess that defaulted to green.
+	ChecksStatus string `json:"checks_status,omitempty"`
 }
 
 // SessionMessage is one line in messages.jsonl.
@@ -91,6 +103,15 @@ func (s *Session) SpaceID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Manifest.SpaceID
+}
+
+// SetSpaceID binds the session to a space. Used when a real session exists
+// but was persisted before space_id was stamped (or when first binding a
+// space-thread session).
+func (s *Session) SetSpaceID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Manifest.SpaceID = id
 }
 
 // Touch bumps the session's UpdatedAt to now under the manifest lock.

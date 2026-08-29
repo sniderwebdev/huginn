@@ -59,6 +59,7 @@ type Agent struct {
 	Toolbelt            []ToolbeltEntry
 	Skills              []string
 	LocalTools          []string // tool names granted to this agent; ["*"] = all builtins
+	ApprovedTools       []string // tool names pre-approved to skip permission prompts
 }
 
 // Rename updates the agent's Name and re-indexes it in the registry under the
@@ -148,6 +149,7 @@ func (a *Agent) cloneUnlocked() Agent {
 		Toolbelt:           append([]ToolbeltEntry(nil), a.Toolbelt...),
 		Skills:             append([]string(nil), a.Skills...),
 		LocalTools:         append([]string(nil), a.LocalTools...),
+		ApprovedTools:      append([]string(nil), a.ApprovedTools...),
 		ClaudeAllowedTools: append([]string(nil), a.ClaudeAllowedTools...),
 		ClaudeGatedTools:   append([]string(nil), a.ClaudeGatedTools...),
 		// History is intentionally not copied — the copy is request-scoped.
@@ -214,30 +216,33 @@ func (a *Agent) SnapshotHistory(n int) []backend.Message {
 
 // BuildPersonaPrompt constructs the system prompt for an agent call,
 // prepending the agent's persona before the codebase context block.
+// An addendum lists this agent's local tools, image-generation grant,
+// and whether it can delegate — so the model can say so like a teammate
+// instead of crashing on a missing capability.
 func BuildPersonaPrompt(ag *Agent, ctxText string) string {
+	var body string
 	if ag.SystemPrompt != "" {
 		prefix := ""
 		if ag.Name != "" {
 			prefix = "Your name is " + ag.Name + ".\n\n"
 		}
-		return prefix + ag.SystemPrompt + "\n\n" + ctxText
+		body = prefix + ag.SystemPrompt
+	} else {
+		body = "You are " + ag.Name + ", an expert assistant. " +
+			"Use markdown formatting — tables, bold, code blocks, lists — when it improves readability."
 	}
-	return "You are " + ag.Name + ", an expert assistant. " +
-		"Use markdown formatting — tables, bold, code blocks, lists — when it improves readability.\n\n" + ctxText
+	if add := capabilityAddendum(ag); add != "" {
+		body += "\n\n" + add
+	}
+	return body + "\n\n" + ctxText
 }
 
 // BuildPersonaPromptWithRoster builds the system prompt for a primary agent,
 // appending the agent roster when one is provided. Returns the base prompt
-// unchanged if roster is empty.
+// unchanged if roster is empty. Delegation instructions are omitted when
+// the agent's model does not support delegation (TierLow).
 func BuildPersonaPromptWithRoster(ag *Agent, ctxText, roster string) string {
-	base := BuildPersonaPrompt(ag, ctxText)
-	if roster == "" {
-		return base
-	}
-	return base + "\n\n## Your Team\n" + roster +
-		"\n\nUse `delegate_to_agent` to assign sub-tasks to team members, then `wait_for_threads` to collect their full results when you need them before replying. " +
-		"Only delegate when the request clearly requires another agent's specialized expertise. " +
-		"For simple conversational messages (greetings, questions, general chat), respond directly — do not delegate."
+	return AppendTeamRoster(BuildPersonaPrompt(ag, ctxText), roster, AgentSupportsDelegation(ag))
 }
 
 // BuildPersonaPromptWithMemory constructs the system prompt with cross-session context.
@@ -276,6 +281,14 @@ type AgentRegistry struct {
 	mu         sync.RWMutex
 	agents     map[string]*Agent
 	vaultNames map[string]string // vaultName → first agent name that claimed it
+
+	// ephemeral holds one-off specialist agents spawned via spawn_specialist.
+	// It is a separate overlay map, keyed lowercase like agents, so it
+	// SURVIVES ReloadFromConfig (which only replaces r.agents/r.vaultNames).
+	// ByName consults this overlay after the main map; All() and Names()
+	// NEVER do — invisibility from the roster, handleListAgents, and mention
+	// autocomplete is structural, not a filter applied later.
+	ephemeral map[string]*Agent
 }
 
 // NewRegistry creates an empty AgentRegistry.
@@ -283,6 +296,7 @@ func NewRegistry() *AgentRegistry {
 	return &AgentRegistry{
 		agents:     make(map[string]*Agent),
 		vaultNames: make(map[string]string),
+		ephemeral:  make(map[string]*Agent),
 	}
 }
 
@@ -327,6 +341,9 @@ func (r *AgentRegistry) TryRegister(a *Agent) error {
 	if _, exists := r.agents[key]; exists {
 		return fmt.Errorf("%w: %q", ErrDuplicateAgentName, a.Name)
 	}
+	if _, exists := r.ephemeral[key]; exists {
+		return fmt.Errorf("%w: %q", ErrDuplicateAgentName, a.Name)
+	}
 	r.agents[key] = a
 	if a.VaultName != "" {
 		if owner, collision := r.vaultNames[a.VaultName]; collision && owner != a.Name {
@@ -356,12 +373,79 @@ func (r *AgentRegistry) Unregister(name string) {
 	delete(r.agents, key)
 }
 
-// ByName looks up an agent by name (case-insensitive).
+// ByName looks up an agent by name (case-insensitive). Consults the main
+// roster first, then falls back to the ephemeral specialist overlay so
+// spawned one-off specialists remain resolvable (e.g. for delegation,
+// dispatch, and cost tracking) without appearing in the roster.
 func (r *AgentRegistry) ByName(name string) (*Agent, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	a, ok := r.agents[strings.ToLower(name)]
+	key := strings.ToLower(name)
+	if a, ok := r.agents[key]; ok {
+		return a, ok
+	}
+	a, ok := r.ephemeral[key]
 	return a, ok
+}
+
+// RegisterEphemeral adds a one-off specialist agent to the ephemeral overlay.
+// The overlay survives ReloadFromConfig. Returns ErrDuplicateAgentName if the
+// name (case-insensitive) collides with either the main roster or an
+// existing ephemeral entry.
+func (r *AgentRegistry) RegisterEphemeral(a *Agent) error {
+	if a == nil {
+		return fmt.Errorf("agents: RegisterEphemeral called with nil agent")
+	}
+	if strings.TrimSpace(a.Name) == "" {
+		return fmt.Errorf("agents: RegisterEphemeral called with empty agent name")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := strings.ToLower(a.Name)
+	if _, exists := r.agents[key]; exists {
+		return fmt.Errorf("%w: %q", ErrDuplicateAgentName, a.Name)
+	}
+	if _, exists := r.ephemeral[key]; exists {
+		return fmt.Errorf("%w: %q", ErrDuplicateAgentName, a.Name)
+	}
+	r.ephemeral[key] = a
+	return nil
+}
+
+// UnregisterEphemeral removes the named agent (case-insensitive) from the
+// ephemeral overlay only. No-op if not found there. Never touches the main
+// roster, so calling it with a seated agent's name is a safe no-op.
+func (r *AgentRegistry) UnregisterEphemeral(name string) {
+	key := strings.ToLower(name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.ephemeral, key)
+}
+
+// IsEphemeral reports whether name (case-insensitive) resolves to an
+// ephemeral specialist rather than a seated roster agent.
+func (r *AgentRegistry) IsEphemeral(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, inMain := r.agents[strings.ToLower(name)]
+	if inMain {
+		return false
+	}
+	_, ok := r.ephemeral[strings.ToLower(name)]
+	return ok
+}
+
+// EphemeralAgents returns all currently registered ephemeral specialists
+// (order not guaranteed). Intended for TTL sweeps and diagnostics — not for
+// roster/listing surfaces, which must use All() instead.
+func (r *AgentRegistry) EphemeralAgents() []*Agent {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]*Agent, 0, len(r.ephemeral))
+	for _, a := range r.ephemeral {
+		result = append(result, a)
+	}
+	return result
 }
 
 // All returns all registered agents (order not guaranteed).

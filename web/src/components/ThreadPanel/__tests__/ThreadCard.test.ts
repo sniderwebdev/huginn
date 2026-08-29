@@ -271,6 +271,16 @@ describe('ThreadCard — tool calls section', () => {
     expect(wrapper.html()).toContain('running')
   })
 
+  it('shows "failed" instead of "done" when the tool result is an error', async () => {
+    const wrapper = mountCard(makeThread({
+      toolCalls: [{ tool: 'json', done: true, resultSummary: 'error: tool "json" is not available' }],
+    }))
+    const toolsBtn = wrapper.findAll('button').find(b => b.text().includes('tool call'))
+    await toolsBtn!.trigger('click')
+    expect(wrapper.html()).toContain('failed')
+    expect(wrapper.text()).not.toMatch(/\bdone\b/)
+  })
+
   it('shows "done" indicator for a completed tool call when expanded', async () => {
     const wrapper = mountCard(makeThread({
       toolCalls: [{ tool: 'read_file', done: true }],
@@ -536,5 +546,29 @@ describe('ThreadCard — activity heartbeat', () => {
   it('renders no activity line when no heartbeat has arrived', () => {
     const wrapper = mountCard(makeThread({ Status: 'thinking' }))
     expect(wrapper.text()).not.toContain('may be stalled')
+  })
+})
+
+// ── S4: specialist "temporary" pill + model id ────────────────────────────
+
+describe('ThreadCard — specialist (spawn_specialist) badge', () => {
+  it('renders a "temporary" pill for a specialist thread', () => {
+    const wrapper = mountCard(makeThread({ IsSpecialist: true, ModelID: 'claude-opus-4-6' }))
+    expect(wrapper.text()).toContain('temporary')
+  })
+
+  it('renders the specialist model id', () => {
+    const wrapper = mountCard(makeThread({ IsSpecialist: true, ModelID: 'claude-opus-4-6' }))
+    expect(wrapper.text()).toContain('claude-opus-4-6')
+  })
+
+  it('does not render the temporary pill for a regular (roster) thread', () => {
+    const wrapper = mountCard(makeThread({ IsSpecialist: false }))
+    expect(wrapper.text()).not.toContain('temporary')
+  })
+
+  it('does not render a model id line when not a specialist', () => {
+    const wrapper = mountCard(makeThread({ IsSpecialist: false, ModelID: 'claude-opus-4-6' }))
+    expect(wrapper.text()).not.toContain('claude-opus-4-6')
   })
 })

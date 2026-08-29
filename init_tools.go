@@ -65,11 +65,12 @@ func initTools(
 	tools.RegisterBuiltins(toolReg, cwd, bashTimeout)
 	tools.RegisterGitTools(toolReg, cwd)
 	tools.RegisterTestsTool(toolReg, cwd, bashTimeout)
-	tools.RegisterGitHubTools(toolReg)
+	tools.RegisterGitHubTools(toolReg, cwd)
 	toolReg.TagTools(tools.GitHubCLIToolNames(), "github_cli")
 	toolReg.TagTools(tools.BuiltinToolNames(), "builtin")
 	tools.RegisterWorktreeTools(toolReg, cwd)
 	tools.RegisterNotesTool(toolReg, huginnHome, agentReg)
+	tools.RegisterWriteWorkflowTool(toolReg, huginnHome)
 	tools.RegisterClaudeCodeTool(toolReg, cfg.ClaudeCode, cwd, nil)
 
 	// --- Connection (OAuth) tools ---

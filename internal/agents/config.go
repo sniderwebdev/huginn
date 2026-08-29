@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -98,6 +99,27 @@ type AgentDef struct {
 	// ["*"] = all builtin tools (God Mode).
 	// Named list = only those specific tools.
 	LocalTools []string `json:"local_tools,omitempty"           yaml:"local_tools,omitempty"`
+
+	// ApprovedTools is the allowlist of tool names this agent may run
+	// without a permission prompt, persisted from "Always allow for
+	// <Agent>" decisions made in the permission banner (serve mode). Unlike
+	// LocalTools (which grants tool *visibility*), ApprovedTools only
+	// affects the permission gate: a tool must already be visible via
+	// LocalTools/Toolbelt to be called at all. Names are seeded into the
+	// per-run forked gate's session-allowed set (see applyToolbelt), so
+	// future runs skip prompting for these specific tools.
+	ApprovedTools []string `json:"approved_tools,omitempty"        yaml:"approved_tools,omitempty"`
+
+	// LoadedApprovedTools is a transient API-bridge field, NOT persisted to
+	// disk: the AgentsView editor should echo back the approved_tools it
+	// received when the edit form was loaded, alongside the (possibly
+	// unedited) current ApprovedTools value. This lets persistAgent tell
+	// "user explicitly edited the chips" apart from "form still holds its
+	// as-loaded snapshot" — see persistAgent's approved-tools RMW-race fix.
+	// A client that omits this field (old client, direct API caller) is
+	// treated as "did not edit": ApprovedTools is authoritative only when
+	// it differs from LoadedApprovedTools.
+	LoadedApprovedTools []string `json:"loaded_approved_tools,omitempty" yaml:"-"`
 
 	// Description is a short (max 500 bytes) human-readable summary of what this agent does.
 	// Visible to other agents in channel contexts for intelligent task delegation.
@@ -336,6 +358,7 @@ func FromDef(def AgentDef) *Agent {
 		Toolbelt:            def.Toolbelt,
 		Skills:              def.Skills,
 		LocalTools:          def.LocalTools,
+		ApprovedTools:       def.ApprovedTools,
 	}
 }
 
@@ -410,10 +433,12 @@ func LoadAgentsFromBase(baseDir string) (*AgentsConfig, error) {
 			switch filepath.Ext(path) {
 			case ".json":
 				if err := json.Unmarshal(data, &agent); err != nil {
+					slog.Warn("agents: skip unreadable agent file", "path", path, "err", err)
 					continue
 				}
 			case ".yaml", ".yml":
 				if err := yaml.Unmarshal(data, &agent); err != nil {
+					slog.Warn("agents: skip unreadable agent file", "path", path, "err", err)
 					continue
 				}
 			default:

@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import { api, getToken } from './useApi'
+import { api, getToken, type FileDiff } from './useApi'
 
 // hydrationQueueOverflowed is set to true when any session's pre-hydration WS
 // event queue exceeds MAX_HYDRATION_QUEUE_SIZE. Components can watch this ref
@@ -40,6 +40,8 @@ export interface ToolCallRecord {
   args: Record<string, unknown>
   result?: string
   done: boolean
+  diff?: FileDiff
+  checksStatus?: string
 }
 
 export interface DelegatedThread {
@@ -78,10 +80,19 @@ export interface ChatMessage {
   permissionDenials?: PermissionDenial[]
   threadSummary?: boolean       // true for synthetic completion cards injected on thread_done
   threadSummaryThreadId?: string // thread ID this completion card belongs to (dedup guard)
+  threadSummaryFailed?: boolean // true when the completion is a StatusError/timeout failure, not an accomplishment
+  systemLine?: boolean          // harness announcement rendered as a system/delegation row
+  hideFailSpeech?: boolean      // suppress bare TOOL_FAIL/DELEGATE_FAIL on a parent A2A row
   // Space-mode fields present on messages fetched from container history
   session_id?: string
   seq?: number
   ts?: string
+  parent_id?: string
+  spaceReplyCount?: number  // Slack-style reply chip (not work-inspector replyCount)
+  lastPreview?: string
+  newSince?: number
+  spaceReplyTyping?: string
+  spaceReplyParticipant?: boolean
 }
 
 // Module-level shared state (singleton across all component instances)
@@ -260,6 +271,8 @@ export function useSessions() {
                 args: (tc.args as Record<string, unknown>) ?? {},
                 result: (tc.result as string | undefined) ?? undefined,
                 done: true,
+                diff: (tc.diff as FileDiff | undefined) ?? undefined,
+                checksStatus: (tc.checks_status as string | undefined) ?? undefined,
               }))
             : undefined
           return {
@@ -267,7 +280,7 @@ export function useSessions() {
             role: r.role as 'user' | 'assistant',
             content: r.content as string,
             agent: (r.agent as string | undefined) || undefined,
-            createdAt: (r.ts as string | undefined) || undefined,
+            createdAt: (r.created_at as string | undefined) || (r.ts as string | undefined) || undefined,
             toolCalls,
             threadSummary: (r.type === 'thread_event' && r.tool_name === 'thread_done') || undefined,
             threadSummaryThreadId: (r.type === 'thread_event' && typeof r.tool_call_id === 'string')
