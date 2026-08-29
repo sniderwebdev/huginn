@@ -4,6 +4,7 @@ package session
 import (
 	"database/sql"
 	"errors"
+	"regexp"
 	"strings"
 
 	"github.com/scrypster/huginn/internal/sqlitedb"
@@ -28,6 +29,7 @@ func Migrations() []sqlitedb.Migration {
 		{Name: "sessions_message_count_backfill_v1", Up: migrateSessionsMessageCountBackfillV1},
 		{Name: "sessions_external_columns_v1", Up: migrateSessionsExternalColumnsV1},
 		{Name: "claude_ingest_v1", Up: migrateClaudeIngestV1},
+		{Name: "repair_dangling_message_views_v1", Up: migrateRepairDanglingMessageViewsV1},
 	}
 }
 
@@ -48,8 +50,30 @@ func migrateMessagesTypeThreadEventV1(tx *sql.Tx) error {
 		return nil
 	}
 
-	if _, err := tx.Exec(`ALTER TABLE messages RENAME TO messages_old`); err != nil {
+	// SQLite REWRITES VIEW DEFINITIONS to follow an ALTER TABLE ... RENAME TO
+	// unless legacy_alter_table is on. Without this pragma, renaming messages
+	// silently repoints every view over it at messages_old — and the DROP at
+	// the end of this migration then leaves each of them dangling.
+	//
+	// That is not hypothetical: it shipped. The damage stayed invisible for
+	// months because nothing resolved those views, until a later migration
+	// touched one and SQLite raised "no such table: main.messages_old". The
+	// whole spaces migration aborted and the API began answering "spaces not
+	// configured", with the cause several migrations and an unrelated
+	// subsystem away from the symptom.
+	//
+	// The pragma is restored immediately after the rename rather than left set
+	// for the rest of the transaction, so nothing else in this migration
+	// inherits legacy ALTER semantics.
+	if _, err := tx.Exec(`PRAGMA legacy_alter_table = ON`); err != nil {
 		return err
+	}
+	_, renameErr := tx.Exec(`ALTER TABLE messages RENAME TO messages_old`)
+	if _, err := tx.Exec(`PRAGMA legacy_alter_table = OFF`); err != nil {
+		return err
+	}
+	if renameErr != nil {
+		return renameErr
 	}
 	if _, err := tx.Exec(`
 		CREATE TABLE messages (
@@ -538,4 +562,58 @@ func migrateClaudeIngestV1(tx *sql.Tx) error {
 			updated_at        INTEGER NOT NULL DEFAULT 0
 		)`)
 	return err
+}
+
+// danglingMessagesOld matches the messages_old identifier in any of the forms
+// SQLite may have written it into a stored view definition.
+var danglingMessagesOld = regexp.MustCompile("(?i)(\"messages_old\"|`messages_old`|\\[messages_old\\]|\\bmessages_old\\b)")
+
+// migrateRepairDanglingMessageViewsV1 repoints views left referencing
+// messages_old back at messages.
+//
+// messages_type_thread_event_v1 rebuilt the messages table by renaming it to
+// messages_old, and SQLite rewrote every view over messages to follow that
+// rename. The migration then dropped messages_old, leaving those views
+// dangling. That migration is now guarded with legacy_alter_table, but the
+// guard only helps installs that have not run it yet — databases that already
+// have are carrying broken views right now, and they fail the moment any later
+// migration causes SQLite to resolve one. Observed in the wild: the spaces
+// migration aborted and the API answered "spaces not configured".
+//
+// The stored definition is the original with a single identifier substituted,
+// so substituting it back restores the view exactly. Dropping and recreating
+// is the only way to change a view's SQL in SQLite.
+//
+// Idempotent: on a healthy database no view matches and this does nothing.
+func migrateRepairDanglingMessageViewsV1(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT name, sql FROM sqlite_master
+	                       WHERE type = 'view' AND sql LIKE '%messages_old%'`)
+	if err != nil {
+		return err
+	}
+	type view struct{ name, ddl string }
+	var broken []view
+	for rows.Next() {
+		var v view
+		if err := rows.Scan(&v.name, &v.ddl); err != nil {
+			rows.Close()
+			return err
+		}
+		broken = append(broken, v)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, v := range broken {
+		if _, err := tx.Exec(`DROP VIEW IF EXISTS "` + v.name + `"`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(danglingMessagesOld.ReplaceAllString(v.ddl, "messages")); err != nil {
+			return err
+		}
+	}
+	return nil
 }

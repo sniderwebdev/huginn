@@ -13,8 +13,8 @@ import (
 
 func TestMigrationsRegistered(t *testing.T) {
 	migs := session.Migrations()
-	if len(migs) != 12 {
-		t.Fatalf("expected 12 migrations, got %d", len(migs))
+	if len(migs) != 13 {
+		t.Fatalf("expected 13 migrations, got %d", len(migs))
 	}
 }
 
